@@ -143,6 +143,7 @@ var initSigmask sigset
 
 // The main goroutine.
 func main() {
+	// 获取一个g，这里的g是汇编初始化创建的，方法的具体逻辑是编译时填充的，所以这里暂时不用管实现
 	g := getg()
 
 	// Racectx of m0->g0 is used only as the parent of the main goroutine.
@@ -152,6 +153,9 @@ func main() {
 	// Max stack size is 1 GB on 64-bit, 250 MB on 32-bit.
 	// Using decimal instead of binary GB and MB because
 	// they look nicer in the stack overflow failure message.
+
+	// 判断系统位数，然后设置最大栈空间，这里可以使用此方法判断系统是64位还是32位
+	// const PtrSize = 4 << (^uintptr(0) >> 63)
 	if goarch.PtrSize == 8 {
 		maxstacksize = 1000000000
 	} else {
@@ -162,15 +166,21 @@ func main() {
 	// after calling SetMaxStack and trying to allocate a stack that is too big,
 	// since stackalloc works with 32-bit sizes.
 	maxstackceiling = 2 * maxstacksize
+	// 上面两个参数都与栈有关，具体可以看 runtime/stack.go 这个文件
 
 	// Allow newproc to start new Ms.
+	// 允许newproc方法创建新的M
 	mainStarted = true
 
 	if GOARCH != "wasm" { // no threads on wasm yet, so no sysmon
 		// For runtime_syscall_doAllThreadsSyscall, we
 		// register sysmon is not ready for the world to be
 		// stopped.
+		// 除了wasm，开启sysmon线程，这个线程很重要，主要包括netpoll, gc
+		// 抢占调度等，具体可以看后面
+		// 设置sysmon启动标识
 		atomic.Store(&sched.sysmonStarting, 1)
+		// 新建一个newm, 然后在系统栈中运行sysmon
 		systemstack(func() {
 			newm(sysmon, nil, -1)
 		})
@@ -187,6 +197,7 @@ func main() {
 	if g.m != &m0 {
 		throw("runtime.main not on m0")
 	}
+	// 不需要p运行的线程是false, 例如sysmon 和 newmHandoff
 	m0.doesPark = true
 
 	// Record when the world started.
@@ -201,6 +212,7 @@ func main() {
 		inittrace.active = true
 	}
 
+	// 初始化runtime_inittask
 	doInit(&runtime_inittask) // Must be before defer.
 
 	// Defer unlock so that runtime.Goexit during init does the unlock too.
@@ -211,6 +223,7 @@ func main() {
 		}
 	}()
 
+	// 开启gc
 	gcenable()
 
 	main_init_done = make(chan bool)
@@ -775,24 +788,30 @@ func mcommoninit(mp *m, id int64) {
 	_g_ := getg()
 
 	// g0 stack won't make sense for user (and is not necessary unwindable).
+	// 如果当前g不是g0，则调用callers
 	if _g_ != _g_.m.g0 {
 		callers(1, mp.createstack[:])
 	}
+	// g0 逻辑
 
+	// 加锁
 	lock(&sched.lock)
 
 	if id >= 0 {
 		mp.id = id
 	} else {
+		// 生成id，此时会检测是否加锁，根据当前m的数量进行+1, 默认从1开始
 		mp.id = mReserveID()
 	}
 
+	// 暂时不知道fastrand的作用
 	mp.fastrand[0] = uint32(int64Hash(uint64(mp.id), fastrandseed))
 	mp.fastrand[1] = uint32(int64Hash(uint64(cputicks()), ^fastrandseed))
 	if mp.fastrand[0]|mp.fastrand[1] == 0 {
 		mp.fastrand[1] = 1
 	}
 
+	// 申请内存
 	mpreinit(mp)
 	if mp.gsignal != nil {
 		mp.gsignal.stackguard1 = mp.gsignal.stack.lo + _StackGuard
@@ -800,10 +819,12 @@ func mcommoninit(mp *m, id int64) {
 
 	// Add to allm so garbage collector doesn't free g->m
 	// when it is just in a register or thread-local storage.
+	// 指向所有m
 	mp.alllink = allm
 
 	// NumCgoCall() iterates over allm w/o schedlock,
 	// so we need to publish it safely.
+	// 加入allm
 	atomicstorep(unsafe.Pointer(&allm), unsafe.Pointer(mp))
 	unlock(&sched.lock)
 
@@ -1834,14 +1855,18 @@ type cgothreadstart struct {
 //
 //go:yeswritebarrierrec
 func allocm(_p_ *p, fn func(), id int64) *m {
+	// 获取当前的g
 	_g_ := getg()
+	// 对当前m上锁
 	acquirem() // disable GC because it can be called from sysmon
+	// 如果当前m没有p, 创建sysmon的时候是存在p的，使用的是初始化时的p
 	if _g_.m.p == 0 {
 		acquirep(_p_) // temporarily borrow p for mallocs in this function
 	}
 
 	// Release the free M list. We need to do this somewhere and
 	// this may free up a stack we can use.
+	// sysmon 创建的时候没有freem，所以略过
 	if sched.freem != nil {
 		lock(&sched.lock)
 		var newList *m
@@ -1864,9 +1889,11 @@ func allocm(_p_ *p, fn func(), id int64) *m {
 		sched.freem = newList
 		unlock(&sched.lock)
 	}
-
+	// 新建一个m结构体
 	mp := new(m)
+	// 将执行方法赋值
 	mp.mstartfn = fn
+	// 初始化
 	mcommoninit(mp, id)
 
 	// In case of cgo or Solaris or illumos or Darwin, pthread_create will make us a stack.
@@ -1878,9 +1905,12 @@ func allocm(_p_ *p, fn func(), id int64) *m {
 	}
 	mp.g0.m = mp
 
+	// 如果传入的p和当前g的p是一个，则释放
+	// sysmon创建的时候传入的p是nil
 	if _p_ == _g_.m.p.ptr() {
 		releasep()
 	}
+	// 释放当前g的m，表示当前m没有在执行g
 	releasem(_g_.m)
 
 	return mp
@@ -2191,10 +2221,12 @@ var newmHandoff struct {
 // id is optional pre-allocated m ID. Omit by passing -1.
 //go:nowritebarrierrec
 func newm(fn func(), _p_ *p, id int64) {
+	// 新建m，支持传入p，id为-1则没有p
 	mp := allocm(_p_, fn, id)
 	mp.doesPark = (_p_ != nil)
 	mp.nextp.set(_p_)
 	mp.sigmask = initSigmask
+	// cgo
 	if gp := getg(); gp != nil && gp.m != nil && (gp.m.lockedExt != 0 || gp.m.incgo) && GOOS != "plan9" {
 		// We're on a locked M or a thread that may have been
 		// started by C. The kernel state of this thread may
@@ -2240,7 +2272,9 @@ func newm1(mp *m) {
 		execLock.runlock()
 		return
 	}
+	// 防止进程克隆
 	execLock.rlock() // Prevent process clone.
+	// 这里是创建一个内核线程
 	newosproc(mp)
 	execLock.runlock()
 }
@@ -2439,8 +2473,10 @@ func startm(_p_ *p, spinning bool) {
 	mp := acquirem()
 	lock(&sched.lock)
 	if _p_ == nil {
+		// 获取一个空闲的p
 		_p_ = pidleget()
 		if _p_ == nil {
+			// 如果没有空闲的p，则释放m
 			unlock(&sched.lock)
 			if spinning {
 				// The caller incremented nmspinning, but there are no idle Ps,
@@ -2453,7 +2489,9 @@ func startm(_p_ *p, spinning bool) {
 			return
 		}
 	}
+	// 获取一个空闲的m
 	nmp := mget()
+	// 如果没有空闲m，则创建一个
 	if nmp == nil {
 		// No M is available, we must drop sched.lock and call newm.
 		// However, we already own a P to assign to the M.
@@ -2467,20 +2505,25 @@ func startm(_p_ *p, spinning bool) {
 		// thus marking it as 'running' before we drop sched.lock. This
 		// new M will eventually run the scheduler to execute any
 		// queued G's.
+		// 为了防止其他G监测到没有M可以使用而抛出异常，所以这里先生成一个id
+		// 然后再释放锁
 		id := mReserveID()
 		unlock(&sched.lock)
 
 		var fn func()
+		// 如果自旋，则创建自旋
 		if spinning {
 			// The caller incremented nmspinning, so set m.spinning in the new M.
 			fn = mspinning
 		}
+		// 新建一个m，并绑定p
 		newm(fn, _p_, id)
 		// Ownership transfer of _p_ committed by start in newm.
 		// Preemption is now safe.
 		releasem(mp)
 		return
 	}
+	// 存在空闲m
 	unlock(&sched.lock)
 	if nmp.spinning {
 		throw("startm: m is spinning")
@@ -2494,6 +2537,7 @@ func startm(_p_ *p, spinning bool) {
 	// The caller incremented nmspinning, so set m.spinning in the new M.
 	nmp.spinning = spinning
 	nmp.nextp.set(_p_)
+	// 唤醒m
 	notewakeup(&nmp.park)
 	// Ownership transfer of _p_ committed by wakeup. Preemption is now
 	// safe.
@@ -3229,6 +3273,7 @@ func injectglist(glist *gList) {
 
 	// Mark all the goroutines as runnable before we put them
 	// on the run queues.
+	// 修改所有g的状态为runnable
 	head := glist.head.ptr()
 	var tail *g
 	qsize := 0
@@ -3246,27 +3291,34 @@ func injectglist(glist *gList) {
 
 	startIdle := func(n int) {
 		for ; n != 0 && sched.npidle != 0; n-- {
+			// 获取空闲的p和m，然后唤醒他们（会从p自己的对列或者全局队列获取g执行）
 			startm(nil, false)
 		}
 	}
 
 	pp := getg().m.p.ptr()
+	// 如果p为空，则将队列放进全局队列，然后唤醒所有空闲的p，启动m
 	if pp == nil {
 		lock(&sched.lock)
+		// 将所有g放入sched.runq
 		globrunqputbatch(&q, int32(qsize))
 		unlock(&sched.lock)
 		startIdle(qsize)
 		return
 	}
 
+	// 如果存在p，则根据空闲p的个数，往全局队列里放
+	// 未放完的，放入自己的队列
 	npidle := int(atomic.Load(&sched.npidle))
 	var globq gQueue
 	var n int
+	// 从队列尾部取出g放入全局队列
 	for n = 0; n < npidle && !q.empty(); n++ {
 		g := q.pop()
 		globq.pushBack(g)
 	}
 	if n > 0 {
+		// 放入全局队列并立刻执行
 		lock(&sched.lock)
 		globrunqputbatch(&globq, int32(n))
 		unlock(&sched.lock)
@@ -3275,6 +3327,7 @@ func injectglist(glist *gList) {
 	}
 
 	if !q.empty() {
+		// 将上下的g放入pp，如果放不下，剩下的还是放回全局队列
 		runqputbatch(pp, &q, qsize)
 	}
 }
@@ -4202,9 +4255,12 @@ func syscall_runtime_AfterExec() {
 
 // Allocate a new g, with a stack big enough for stacksize bytes.
 func malg(stacksize int32) *g {
+	// 新建一个g
 	newg := new(g)
 	if stacksize >= 0 {
+		// 适配不同系统的栈的大小
 		stacksize = round2(_StackSystem + stacksize)
+		// 申请stack
 		systemstack(func() {
 			newg.stack = stackalloc(uint32(stacksize))
 		})
@@ -4221,12 +4277,16 @@ func malg(stacksize int32) *g {
 // Put it on the queue of g's waiting to run.
 // The compiler turns a go statement into a call to this.
 func newproc(fn *funcval) {
+	// go 关键字的调用处
 	gp := getg()
 	pc := getcallerpc()
+	// 系统栈中调用方法
 	systemstack(func() {
+		// 真实创建方法
 		newg := newproc1(fn, gp, pc)
 
 		_p_ := getg().m.p.ptr()
+		// 将newg放入当前p的本地队列，如果本地满了，放入全局队列
 		runqput(_p_, newg, true)
 
 		if mainStarted {
@@ -4247,11 +4307,15 @@ func newproc1(fn *funcval, callergp *g, callerpc uintptr) *g {
 	}
 	acquirem() // disable preemption because it can be holding p in a local var
 
+	// 获取当前g对应的p
 	_p_ := _g_.m.p.ptr()
+	// 获取已经结束的或初始化的g。相当于缓存
 	newg := gfget(_p_)
 	if newg == nil {
+		// 如果没有，则创建一个，并把状态设置为Gdead
 		newg = malg(_StackMin)
 		casgstatus(newg, _Gidle, _Gdead)
+		// 添加到全局allg中
 		allgadd(newg) // publishes with a g->status of Gdead so GC scanner doesn't look at uninitialized stack.
 	}
 	if newg.stack.hi == 0 {
@@ -4262,6 +4326,7 @@ func newproc1(fn *funcval, callergp *g, callerpc uintptr) *g {
 		throw("newproc1: new g is not Gdead")
 	}
 
+	// 设置g的堆栈状态
 	totalSize := uintptr(4*goarch.PtrSize + sys.MinFrameSize) // extra space in case of reads slightly beyond frame
 	totalSize = alignUp(totalSize, sys.StackAlign)
 	sp := newg.stack.hi - totalSize
@@ -4278,6 +4343,7 @@ func newproc1(fn *funcval, callergp *g, callerpc uintptr) *g {
 	newg.stktopsp = sp
 	newg.sched.pc = abi.FuncPCABI0(goexit) + sys.PCQuantum // +PCQuantum so that previous instruction is in same function
 	newg.sched.g = guintptr(unsafe.Pointer(newg))
+	// 调整gobuf
 	gostartcallfn(&newg.sched, fn)
 	newg.gopc = callerpc
 	newg.ancestors = saveAncestors(callergp)
@@ -4293,6 +4359,7 @@ func newproc1(fn *funcval, callergp *g, callerpc uintptr) *g {
 	if newg.trackingSeq%gTrackingPeriod == 0 {
 		newg.tracking = true
 	}
+	// 标记g为可运行
 	casgstatus(newg, _Gdead, _Grunnable)
 
 	if _p_.goidcache == _p_.goidcacheend {
@@ -5242,6 +5309,7 @@ var needSysmonWorkaround bool = false
 //
 //go:nowritebarrierrec
 func sysmon() {
+	// 加锁操作nmsys, nmsys主要用来统计不在调度中的m的数量
 	lock(&sched.lock)
 	sched.nmsys++
 	checkdead()
@@ -5256,15 +5324,17 @@ func sysmon() {
 	delay := uint32(0)
 
 	for {
+		// 开始时休眠20us
 		if idle == 0 { // start with 20us sleep...
 			delay = 20
 		} else if idle > 50 { // start doubling the sleep after 1ms...
-			delay *= 2
+			delay *= 2 // 1ms后加倍
 		}
 		if delay > 10*1000 { // up to 10ms
 			delay = 10 * 1000
 		}
 		usleep(delay)
+		// fixup
 		mDoFixup()
 
 		// sysmon should not enter deep sleep if schedtrace is enabled so that
@@ -5283,6 +5353,8 @@ func sysmon() {
 		// from a timer to avoid adding system load to applications that spend
 		// most of their time sleeping.
 		now := nanotime()
+
+		// 如果在 STW，则暂时休眠，或者有计时器触发
 		if debug.schedtrace <= 0 && (sched.gcwaiting != 0 || atomic.Load(&sched.npidle) == uint32(gomaxprocs)) {
 			lock(&sched.lock)
 			if atomic.Load(&sched.gcwaiting) != 0 || atomic.Load(&sched.npidle) == uint32(gomaxprocs) {
@@ -5327,6 +5399,7 @@ func sysmon() {
 		if *cgo_yield != nil {
 			asmcgocall(*cgo_yield, nil)
 		}
+		// 如果超过 10ms 没有 poll，则 poll 一下网络
 		// poll network if not polled for more than 10ms
 		lastpoll := int64(atomic.Load64(&sched.lastpoll))
 		if netpollinited() && lastpoll != 0 && lastpoll+10*1000*1000 < now {
@@ -5340,8 +5413,14 @@ func sysmon() {
 				// another M returns from syscall, finishes running its G,
 				// observes that there is no work to do and no other running M's
 				// and reports deadlock.
+
+				// 由于injectglist会绑定所有空闲的p，当这些p的m还没有开始运行时，一个其他的M运行结束返回时
+				// 监测到当前没有m正在运行，会报告死锁，所以这里先将lock-1，造成有一个m在运行的假象
 				incidlelocked(-1)
+				// injectglist 会绑定所有的 p，但是在它开始 M 运行 P 之前，另一个 M 从 syscall 返回，
+				// 完成运行它的 G ，注意这时候没有 work 要做，且没有其他正在运行 M 的死锁报告。
 				injectglist(&list)
+				// 这里再释放lock
 				incidlelocked(1)
 			}
 		}
@@ -5970,6 +6049,7 @@ func runqputbatch(pp *p, q *gQueue, qsize int) {
 	}
 	qsize -= int(n)
 
+	// 如果是raceenabled，则打乱顺序
 	if randomizeScheduler {
 		off := func(o uint32) uint32 {
 			return (pp.runqtail + o) % uint32(len(pp.runq))

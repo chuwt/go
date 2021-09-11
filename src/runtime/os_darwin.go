@@ -301,6 +301,7 @@ func libpreinit() {
 // Called to initialize a new m (including the bootstrap m).
 // Called on the parent thread (main thread in case of bootstrap), can allocate memory.
 func mpreinit(mp *m) {
+	// 创建gsignal
 	mp.gsignal = malg(32 * 1024) // OS X wants >= 8K
 	mp.gsignal.m = mp
 	if GOOS == "darwin" && GOARCH == "arm64" {
