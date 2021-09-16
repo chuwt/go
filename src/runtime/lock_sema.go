@@ -168,6 +168,7 @@ func notesleep(n *note) {
 	if gp != gp.m.g0 {
 		throw("notesleep not on g0")
 	}
+	// 创建信号量
 	semacreate(gp.m)
 	if !atomic.Casuintptr(&n.key, 0, uintptr(unsafe.Pointer(gp.m))) {
 		// Must be locked (got wakeup).
@@ -181,6 +182,7 @@ func notesleep(n *note) {
 	if *cgo_yield == nil {
 		semasleep(-1)
 	} else {
+		// 休眠
 		// Sleep for an arbitrary-but-moderate interval to poll libc interceptors.
 		const ns = 10e6
 		for atomic.Loaduintptr(&n.key) == 0 {
